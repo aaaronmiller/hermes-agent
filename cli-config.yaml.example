@@ -765,3 +765,59 @@ display:
 #   # Names and usernames are NOT affected (user-chosen, publicly visible).
 #   # Routing/delivery still uses the original values internally.
 #   redact_pii: false
+
+# =============================================================================
+# Heartbeat Configuration (for iterative, continual attention tasks)
+# =============================================================================
+# Control how heartbeat jobs behave — sub-minute intervals, active hours, and
+# response suppression.
+#
+# Global defaults are merged with per-job heartbeat configuration when a job
+# declares `heartbeat: {enabled: true}`.
+heartbeat:
+  enabled: true  # Master switch for ALL heartbeat jobs
+  defaults:
+    isolated_session: true   # Each heartbeat gets fresh context (no chat history)
+    light_context: true      # Reduce token usage by stripping metadata
+    active_hours:            # Optional time window restriction per job
+      start: "08:00"
+      end: "22:00"
+      timezone: "America/Los_Angeles"
+    # mode: "simple"         # "simple" (check once) or "rotate" (check multiple targets) — future use
+
+# =============================================================================
+# Scheduler Configuration
+# =============================================================================
+# How often the cron daemon wakes to check for due jobs. Default is 1 second,
+# enabling sub-minute heartbeat intervals. You can increase this to reduce CPU
+# wakeups at the cost of precision for very fast heartbeats (e.g., 5s intervals).
+scheduler:
+  tick_interval_seconds: 1
+
+# =============================================================================
+# Heartbeat Configuration (for iterative, continual attention tasks)
+# =============================================================================
+# Control how heartbeat jobs behave — sub-minute intervals, active hours, and
+# response suppression.
+#
+# Global defaults are merged with per-job heartbeat configuration when a job
+# declares `heartbeat: {enabled: true}`.
+heartbeat:
+  enabled: true  # Master switch for ALL heartbeat jobs
+  defaults:
+    isolated_session: true   # Each heartbeat gets fresh context (no chat history)
+    light_context: true      # Reduce token usage by stripping metadata
+    active_hours:            # Optional time window restriction per job
+      start: "08:00"
+      end: "22:00"
+      timezone: "America/Los_Angeles"
+    # mode: "simple"         # "simple" (check once) or "rotate" (check multiple targets) — future use
+
+# =============================================================================
+# Scheduler Configuration
+# =============================================================================
+# How often the cron daemon wakes to check for due jobs. Default is 1 second,
+# enabling sub-minute heartbeat intervals. You can increase this to reduce CPU
+# wakeups at the cost of precision for very fast heartbeats (e.g., 5s intervals).
+scheduler:
+  tick_interval_seconds: 1

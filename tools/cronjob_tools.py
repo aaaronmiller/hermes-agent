@@ -1,10 +1,4 @@
-"""
-Cron job management tools for Hermes Agent.
-
-Expose a single compressed action-oriented tool to avoid schema/context bloat.
-Compatibility wrappers remain for direct Python callers and legacy tests.
-"""
-
+"""Cron job management tools for Hermes Agent."""
 import json
 import os
 import re
@@ -12,7 +6,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
@@ -26,12 +19,6 @@ from cron.jobs import (
     trigger_job,
     update_job,
 )
-
-
-# ---------------------------------------------------------------------------
-# Cron prompt scanning — critical-severity patterns only, since cron prompts
-# run in fresh sessions with full tool access.
-# ---------------------------------------------------------------------------
 
 _CRON_THREAT_PATTERNS = [
     (r'ignore\s+(?:\w+\s+)*(?:previous|all|above|prior)\s+(?:\w+\s+)*instructions', "prompt_injection"),
@@ -53,7 +40,6 @@ _CRON_INVISIBLE_CHARS = {
 
 
 def _scan_cron_prompt(prompt: str) -> str:
-    """Scan a cron prompt for critical threats. Returns error string if blocked, else empty."""
     for char in _CRON_INVISIBLE_CHARS:
         if char in prompt:
             return f"Blocked: prompt contains invisible unicode U+{ord(char):04X} (possible injection)."
@@ -93,14 +79,12 @@ def _canonical_skills(skill: Optional[str] = None, skills: Optional[Any] = None)
         raw_items = [skills]
     else:
         raw_items = list(skills)
-
     normalized: List[str] = []
     for item in raw_items:
         text = str(item or "").strip()
         if text and text not in normalized:
             normalized.append(text)
     return normalized
-
 
 
 def _normalize_optional_job_value(value: Optional[Any], *, strip_trailing_slash: bool = False) -> Optional[str]:
@@ -110,7 +94,6 @@ def _normalize_optional_job_value(value: Optional[Any], *, strip_trailing_slash:
     if strip_trailing_slash:
         text = text.rstrip("/")
     return text or None
-
 
 
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -135,6 +118,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
+        "heartbeat_interval_seconds": job.get("heartbeat_interval_seconds"),
+        "heartbeat_enabled": job.get("heartbeat", {}).get("enabled", False),
     }
 
 
@@ -154,16 +139,15 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     task_id: str = None,
+    heartbeat: Optional[dict] = None,
+    heartbeat_interval_seconds: Optional[int] = None,
 ) -> str:
-    """Unified cron job management tool."""
-    del task_id  # unused but kept for handler signature compatibility
-
+    del task_id
     try:
         normalized = (action or "").strip().lower()
-
         if normalized == "create":
-            if not schedule:
-                return json.dumps({"success": False, "error": "schedule is required for create"}, indent=2)
+            if not schedule and heartbeat_interval_seconds is None:
+                return json.dumps({"success": False, "error": "Either schedule or heartbeat_interval_seconds is required for create"}, indent=2)
             canonical_skills = _canonical_skills(skill, skills)
             if not prompt and not canonical_skills:
                 return json.dumps({"success": False, "error": "create requires either prompt or at least one skill"}, indent=2)
@@ -171,7 +155,6 @@ def cronjob(
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
                     return json.dumps({"success": False, "error": scan_error}, indent=2)
-
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
@@ -183,6 +166,8 @@ def cronjob(
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
+                heartbeat=heartbeat,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
             )
             return json.dumps(
                 {
@@ -200,21 +185,17 @@ def cronjob(
                 },
                 indent=2,
             )
-
         if normalized == "list":
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
-
         if not job_id:
-            return json.dumps({"success": False, "error": f"job_id is required for action '{normalized}'"}, indent=2)
-
+            return json.dumps({"success": False, "error": f"job_id is required for action '{action}'"}, indent=2)
         job = get_job(job_id)
         if not job:
             return json.dumps(
                 {"success": False, "error": f"Job with ID '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
                 indent=2,
             )
-
         if normalized == "remove":
             removed = remove_job(job_id)
             if not removed:
@@ -231,19 +212,15 @@ def cronjob(
                 },
                 indent=2,
             )
-
         if normalized == "pause":
             updated = pause_job(job_id, reason=reason)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
-
         if normalized == "resume":
             updated = resume_job(job_id)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
-
         if normalized in {"run", "run_now", "trigger"}:
             updated = trigger_job(job_id)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
-
         if normalized == "update":
             updates: Dict[str, Any] = {}
             if prompt is not None:
@@ -266,7 +243,6 @@ def cronjob(
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
             if repeat is not None:
-                # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
                 repeat_state = dict(job.get("repeat") or {})
                 repeat_state["times"] = normalized_repeat
@@ -278,52 +254,48 @@ def cronjob(
                 if job.get("state") != "paused":
                     updates["state"] = "scheduled"
                     updates["enabled"] = True
+            if heartbeat is not None:
+                updates["heartbeat"] = heartbeat
+            if heartbeat_interval_seconds is not None:
+                updates["heartbeat_interval_seconds"] = heartbeat_interval_seconds
             if not updates:
                 return json.dumps({"success": False, "error": "No updates provided."}, indent=2)
             updated = update_job(job_id, updates)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
-
+        if normalized == "heartbeat":
+            # Subcommand for heartbeat management (on/off/toggle/status/active)
+            if len(sys.argv) > 2:
+                sub = sys.argv[2]
+                from cron.heartbeat import load_heartbeat_config, configure_job_for_heartbeat
+                if sub == "on":
+                    hb_cfg = {"enabled": True}
+                    updates = {"heartbeat": hb_cfg}
+                    updated = update_job(job_id, updates)
+                    return json.dumps({"success": True, "message": f"Heartbeat enabled for job {job_id}", "job": _format_job(updated)}, indent=2)
+                if sub == "off":
+                    hb_cfg = {"enabled": False}
+                    updates = {"heartbeat": hb_cfg}
+                    updated = update_job(job_id, updates)
+                    return json.dumps({"success": True, "message": f"Heartbeat disabled for job {job_id}", "job": _format_job(updated)}, indent=2)
+                if sub == "toggle":
+                    current = job.get("heartbeat", {}).get("enabled", False)
+                    hb_cfg = {"enabled": not current}
+                    updates = {"heartbeat": hb_cfg}
+                    updated = update_job(job_id, updates)
+                    return json.dumps({"success": True, "message": f"Heartbeat toggled to {not current} for job {job_id}", "job": _format_job(updated)}, indent=2)
+                if sub == "status":
+                    hb_info = job.get("heartbeat", {})
+                    return json.dumps({"success": True, "job_id": job_id, "heartbeat": hb_info}, indent=2)
+                if sub == "active":
+                    from cron.heartbeat import cmd_heartbeat_active
+                    import json as _j
+                    active = cmd_heartbeat_active()
+                    print(_j.dumps({"active_heartbeats": active}, indent=2, ensure_ascii=False))
+                    return 0
+            return json.dumps({"success": False, "error": "heartbeat subcommand required: on|off|toggle|status|active"}, indent=2)
         return json.dumps({"success": False, "error": f"Unknown cron action '{action}'"}, indent=2)
-
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Compatibility wrappers
-# ---------------------------------------------------------------------------
-
-def schedule_cronjob(
-    prompt: str,
-    schedule: str,
-    name: Optional[str] = None,
-    repeat: Optional[int] = None,
-    deliver: Optional[str] = None,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
-    base_url: Optional[str] = None,
-    task_id: str = None,
-) -> str:
-    return cronjob(
-        action="create",
-        prompt=prompt,
-        schedule=schedule,
-        name=name,
-        repeat=repeat,
-        deliver=deliver,
-        model=model,
-        provider=provider,
-        base_url=base_url,
-        task_id=task_id,
-    )
-
-
-def list_cronjobs(include_disabled: bool = False, task_id: str = None) -> str:
-    return cronjob(action="list", include_disabled=include_disabled, task_id=task_id)
-
-
-def remove_cronjob(job_id: str, task_id: str = None) -> str:
-    return cronjob(action="remove", job_id=job_id, task_id=task_id)
 
 
 CRONJOB_SCHEMA = {
@@ -333,6 +305,7 @@ CRONJOB_SCHEMA = {
 Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
+Use action='heartbeat' with subcommand on/off/toggle/status/active to control heartbeat features.
 
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
 If skill or skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
@@ -346,63 +319,28 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {
-                "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run"
+            "action": {"type": "string", "description": "One of: create, list, update, pause, resume, remove, run, heartbeat"},
+            "job_id": {"type": "string", "description": "Required for update/pause/resume/remove/run/heartbeat"},
+            "prompt": {"type": "string", "description": "For create: the full self-contained prompt. If skill or skills are also provided, this becomes the task instruction paired with those skills."},
+            "schedule": {"type": "string", "description": "For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp. Not needed if heartbeat_interval_seconds is set."},
+            "name": {"type": "string", "description": "Optional human-friendly name"},
+            "repeat": {"type": "integer", "description": "Optional repeat count. Omit for defaults (once for one-shot, forever for recurring)."},
+            "deliver": {"type": "string", "description": "Delivery target: origin, local, telegram, discord, slack, whatsapp, signal, matrix, mattermost, homeassistant, dingtalk, email, sms, or platform:chat_id or platform:chat_id:thread_id for Telegram topics."},
+            "model": {"type": "string", "description": "Optional per-job model override used when the cron job runs"},
+            "provider": {"type": "string", "description": "Optional per-job provider override used when resolving runtime credentials"},
+            "base_url": {"type": "string", "description": "Optional per-job base URL override paired with provider/model routing"},
+            "include_disabled": {"type": "boolean", "description": "For list: include paused/completed jobs"},
+            "skill": {"type": "string", "description": "Optional single skill name to load before executing the cron prompt"},
+            "skills": {"type": "array", "items": {"type": "string"}, "description": "Optional ordered list of skills to load before executing the cron prompt. On update, pass an empty array to clear attached skills."},
+            "reason": {"type": "string", "description": "Optional pause reason"},
+            "heartbeat": {
+                "type": "object",
+                "description": "Heartbeat configuration: {\"enabled\": true, \"mode\": \"simple|rotate\", \"isolated_session\": bool, \"light_context\": bool, \"active_hours\": {\"start\":\"HH:MM\",\"end\":\"HH:MM\",\"timezone\":\"TZ\"}}"
             },
-            "job_id": {
-                "type": "string",
-                "description": "Required for update/pause/resume/remove/run"
-            },
-            "prompt": {
-                "type": "string",
-                "description": "For create: the full self-contained prompt. If skill or skills are also provided, this becomes the task instruction paired with those skills."
-            },
-            "schedule": {
-                "type": "string",
-                "description": "For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp"
-            },
-            "name": {
-                "type": "string",
-                "description": "Optional human-friendly name"
-            },
-            "repeat": {
+            "heartbeat_interval_seconds": {
                 "type": "integer",
-                "description": "Optional repeat count. Omit for defaults (once for one-shot, forever for recurring)."
+                "description": "Fast heartbeat interval in seconds. Overrides schedule for sub-minute heartbeats."
             },
-            "deliver": {
-                "type": "string",
-                "description": "Delivery target: origin, local, telegram, discord, slack, whatsapp, signal, matrix, mattermost, homeassistant, dingtalk, email, sms, or platform:chat_id or platform:chat_id:thread_id for Telegram topics. Examples: 'origin', 'local', 'telegram', 'telegram:-1001234567890:17585', 'discord:#engineering'"
-            },
-            "model": {
-                "type": "string",
-                "description": "Optional per-job model override used when the cron job runs"
-            },
-            "provider": {
-                "type": "string",
-                "description": "Optional per-job provider override used when resolving runtime credentials"
-            },
-            "base_url": {
-                "type": "string",
-                "description": "Optional per-job base URL override paired with provider/model routing"
-            },
-            "include_disabled": {
-                "type": "boolean",
-                "description": "For list: include paused/completed jobs"
-            },
-            "skill": {
-                "type": "string",
-                "description": "Optional single skill name to load before executing the cron prompt"
-            },
-            "skills": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional ordered list of skills to load before executing the cron prompt. On update, pass an empty array to clear attached skills."
-            },
-            "reason": {
-                "type": "string",
-                "description": "Optional pause reason"
-            }
         },
         "required": ["action"]
     }
@@ -410,13 +348,6 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
 
 
 def check_cronjob_requirements() -> bool:
-    """
-    Check if cronjob tools can be used.
-
-    Available in interactive CLI mode and gateway/messaging platforms.
-    The cron system is internal (JSON file-based scheduler ticked by the gateway),
-    so no external crontab executable is required.
-    """
     return bool(
         os.getenv("HERMES_INTERACTIVE")
         or os.getenv("HERMES_GATEWAY_SESSION")
@@ -425,11 +356,9 @@ def check_cronjob_requirements() -> bool:
 
 
 def get_cronjob_tool_definitions():
-    """Return tool definitions for cronjob management."""
     return [CRONJOB_SCHEMA]
 
 
-# --- Registry ---
 from tools.registry import registry
 
 registry.register(
@@ -452,6 +381,8 @@ registry.register(
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         task_id=kw.get("task_id"),
+        heartbeat=args.get("heartbeat"),
+        heartbeat_interval_seconds=args.get("heartbeat_interval_seconds"),
     ),
     check_fn=check_cronjob_requirements,
     emoji="⏰",
