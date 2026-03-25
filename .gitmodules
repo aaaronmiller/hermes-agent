@@ -1,3 +1,6 @@
 [submodule "tinker-atropos"]
 	path = tinker-atropos
 	url = https://github.com/nousresearch/tinker-atropos
+[submodule "vendor/clawteam"]
+	path = vendor/clawteam
+	url = https://github.com/win4r/ClawTeam-OpenClaw
