@@ -73,6 +73,7 @@ class ContextCompressor:
         api_key: str = "",
         config_context_length: int | None = None,
         provider: str = "",
+        abort_on_summary_failure: bool = False,
     ):
         self.model = model
         self.base_url = base_url
@@ -83,6 +84,7 @@ class ContextCompressor:
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
+        self.abort_on_summary_failure = abort_on_summary_failure
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -135,6 +137,25 @@ class ContextCompressor:
         """Quick pre-flight check using rough estimate (before API call)."""
         rough_estimate = estimate_messages_tokens_rough(messages)
         return rough_estimate >= self.threshold_tokens
+
+    def _effective_protect_last_n(self, n_messages: int) -> int:
+        """Adapt tail protection so smaller sessions can still compact.
+
+        ``protect_last_n`` is a maximum recent-message protection target.  It
+        must not become a hard floor that blocks compaction until a session has
+        dozens of messages.  Keep at least one tail message when possible while
+        leaving at least one middle message available to summarize.
+        """
+        available_tail = n_messages - self.protect_first_n - 2
+        if available_tail < 1:
+            return self.protect_last_n
+        return min(self.protect_last_n, max(1, available_tail))
+
+    def can_compress(self, messages: List[Dict[str, Any]]) -> bool:
+        """Return whether there is a non-empty middle region to compact."""
+        n_messages = len(messages)
+        protect_last_n = self._effective_protect_last_n(n_messages)
+        return n_messages > self.protect_first_n + protect_last_n + 1
 
     def get_status(self) -> Dict[str, Any]:
         """Get current compression status for display/logging."""
@@ -489,8 +510,11 @@ Write only the summary body. Do not include any preamble or prefix."""
     # ------------------------------------------------------------------
 
     def _find_tail_cut_by_tokens(
-        self, messages: List[Dict[str, Any]], head_end: int,
+        self,
+        messages: List[Dict[str, Any]],
+        head_end: int,
         token_budget: int | None = None,
+        protect_last_n: Optional[int] = None,
     ) -> int:
         """Walk backward from the end of messages, accumulating tokens until
         the budget is reached. Returns the index where the tail starts.
@@ -505,7 +529,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         if token_budget is None:
             token_budget = self.tail_token_budget
         n = len(messages)
-        min_tail = self.protect_last_n
+        min_tail = self.protect_last_n if protect_last_n is None else protect_last_n
         accumulated = 0
         cut_idx = n  # start from beyond the end
 
@@ -523,7 +547,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             accumulated += msg_tokens
             cut_idx = i
 
-        # Ensure we protect at least protect_last_n messages
+        # Ensure we protect at least the effective recent-tail message count
         fallback_cut = n - min_tail
         if cut_idx > fallback_cut:
             cut_idx = fallback_cut
@@ -557,12 +581,13 @@ Write only the summary body. Do not include any preamble or prefix."""
         up so the API never receives mismatched IDs.
         """
         n_messages = len(messages)
-        if n_messages <= self.protect_first_n + self.protect_last_n + 1:
+        effective_protect_last_n = self._effective_protect_last_n(n_messages)
+        if not self.can_compress(messages):
             if not self.quiet_mode:
                 logger.warning(
                     "Cannot compress: only %d messages (need > %d)",
                     n_messages,
-                    self.protect_first_n + self.protect_last_n + 1,
+                    self.protect_first_n + effective_protect_last_n + 1,
                 )
             return messages
 
@@ -570,7 +595,7 @@ Write only the summary body. Do not include any preamble or prefix."""
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
-            messages, protect_tail_count=self.protect_last_n * 3,
+            messages, protect_tail_count=effective_protect_last_n * 3,
         )
         if pruned_count and not self.quiet_mode:
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
@@ -580,7 +605,11 @@ Write only the summary body. Do not include any preamble or prefix."""
         compress_start = self._align_boundary_forward(messages, compress_start)
 
         # Use token-budget tail protection instead of fixed message count
-        compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+        compress_end = self._find_tail_cut_by_tokens(
+            messages,
+            compress_start,
+            protect_last_n=effective_protect_last_n,
+        )
 
         if compress_start >= compress_end:
             return messages
@@ -650,6 +679,11 @@ Write only the summary body. Do not include any preamble or prefix."""
         else:
             if not self.quiet_mode:
                 logger.warning("No summary model available — middle turns dropped without summary")
+            if self.abort_on_summary_failure:
+                raise RuntimeError(
+                    "Context compaction summary failed and "
+                    "compression.abort_on_summary_failure is enabled"
+                )
 
         for i in range(compress_end, n_messages):
             msg = messages[i].copy()

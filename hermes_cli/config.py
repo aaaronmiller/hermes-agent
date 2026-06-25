@@ -169,6 +169,7 @@ DEFAULT_CONFIG = {
         "summary_model": "",          # empty = use main configured model
         "summary_provider": "auto",
         "summary_base_url": None,
+        "abort_on_summary_failure": False,  # fail instead of dropping turns without a summary
     },
     "smart_model_routing": {
         "enabled": False,
@@ -189,6 +190,7 @@ DEFAULT_CONFIG = {
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
             "base_url": "",        # direct OpenAI-compatible endpoint (takes precedence over provider)
             "api_key": "",         # API key for base_url (falls back to OPENAI_API_KEY)
+            "api_key_env": "",     # env var containing API key for base_url
             "timeout": 30,         # seconds — increase for slow local vision models
         },
         "web_extract": {
@@ -196,42 +198,49 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_key_env": "",
         },
         "compression": {
             "provider": "auto",
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_key_env": "",
         },
         "session_search": {
             "provider": "auto",
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_key_env": "",
         },
         "skills_hub": {
             "provider": "auto",
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_key_env": "",
         },
         "approval": {
             "provider": "auto",
             "model": "",           # fast/cheap model recommended (e.g. gemini-flash, haiku)
             "base_url": "",
             "api_key": "",
+            "api_key_env": "",
         },
         "mcp": {
             "provider": "auto",
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_key_env": "",
         },
         "flush_memories": {
             "provider": "auto",
             "model": "",
             "base_url": "",
             "api_key": "",
+            "api_key_env": "",
         },
     },
     

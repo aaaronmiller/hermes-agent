@@ -89,6 +89,33 @@ class TestCompress:
         result = compressor.compress(msgs)
         assert result == msgs
 
+    def test_default_protect_last_adapts_for_small_sessions(self):
+        """Default protect_last_n=20 must not block every small-session compaction."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3)
+
+        msgs = self._make_messages(8)
+        with patch.object(c, "_generate_summary", return_value="small-session summary"):
+            result = c.compress(msgs)
+
+        assert len(result) < len(msgs)
+        assert c.compression_count == 1
+
+    def test_abort_on_summary_failure_raises_before_dropping_middle(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=True,
+            )
+
+        msgs = self._make_messages(10)
+        with patch.object(c, "_generate_summary", return_value=None):
+            with pytest.raises(RuntimeError, match="summary failed"):
+                c.compress(msgs)
+
     def test_truncation_fallback_no_client(self, compressor):
         # compressor has client=None, so should use truncation fallback
         msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)

@@ -17,6 +17,8 @@ from agent.auxiliary_client import (
     _get_auxiliary_provider,
     _resolve_forced_provider,
     _resolve_auto,
+    _resolve_task_provider_model,
+    _resolve_config_api_key,
 )
 
 
@@ -944,6 +946,35 @@ class TestTaskSpecificOverrides:
             client, model = get_text_auxiliary_client("compression")
         assert model == "glm-4.7"
         assert mock_openai.call_args.kwargs["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+
+    def test_config_api_key_env_wins_over_direct_key(self, monkeypatch):
+        monkeypatch.setenv("AUX_TEST_KEY", "env-secret")
+        assert _resolve_config_api_key({
+            "api_key": "direct-secret",
+            "api_key_env": "AUX_TEST_KEY",
+        }) == "env-secret"
+
+    def test_compression_task_config_resolves_api_key_env(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            """auxiliary:
+  compression:
+    provider: custom
+    model: config-model
+    base_url: http://localhost:4321/v1
+    api_key_env: AUX_COMPRESSION_KEY
+"""
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("AUX_COMPRESSION_KEY", "compression-secret")
+
+        provider, model, base_url, api_key = _resolve_task_provider_model(task="compression")
+
+        assert provider == "custom"
+        assert model == "config-model"
+        assert base_url == "http://localhost:4321/v1"
+        assert api_key == "compression-secret"
 
 
 class TestAuxiliaryMaxTokensParam:

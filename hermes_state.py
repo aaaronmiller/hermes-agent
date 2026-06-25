@@ -527,16 +527,46 @@ class SessionDB:
         source: str = None,
         limit: int = 20,
         offset: int = 0,
+        include_tool_errors: bool = True,
+        exclude_sources: List[str] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
         Returns dicts with keys: id, source, model, title, started_at, ended_at,
-        message_count, preview (first 60 chars of first user message),
-        last_active (timestamp of last message).
+        message_count, tool_call_count, input_tokens, output_tokens, preview (first
+        60 chars of first user message), last_active (timestamp of last message),
+        duration (seconds, computed from started_at/ended_at), and optionally
+        tool_errors (count of messages with error finish_reason).
 
         Uses a single query with correlated subqueries instead of N+2 queries.
         """
         source_clause = "WHERE s.source = ?" if source else ""
+        tool_errors_subquery = ""
+        if include_tool_errors:
+            # Detect tool errors by content patterns — _detect_tool_failure flags
+            # results starting with "Error", "Error executing tool", or containing
+            # "[error]" / "[exit N]" (N != 0) / "[full]" tags.
+            tool_errors_subquery = """,
+                COALESCE(
+                    (SELECT COUNT(*) FROM messages m3
+                     WHERE m3.session_id = s.id AND m3.role = 'tool'
+                     AND (
+                         m3.content LIKE 'Error executing tool%'
+                         OR m3.content LIKE 'Error: %'
+                         OR m3.content LIKE '[error]%'
+                     )),
+                     0
+                ) AS _tool_errors"""
+        exclude_clause = ""
+        exclude_params = []
+        if exclude_sources:
+            placeholders = ",".join(["?"] * len(exclude_sources))
+            if source:
+                # Already have a WHERE, add AND
+                exclude_clause = f"AND s.source NOT IN ({placeholders})"
+            else:
+                exclude_clause = f"WHERE s.source NOT IN ({placeholders})"
+            exclude_params = list(exclude_sources)
         query = f"""
             SELECT s.*,
                 COALESCE(
@@ -550,12 +580,17 @@ class SessionDB:
                     (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                     s.started_at
                 ) AS last_active
+                {tool_errors_subquery}
             FROM sessions s
-            {source_clause}
+            {source_clause} {exclude_clause}
             ORDER BY s.started_at DESC
             LIMIT ? OFFSET ?
         """
-        params = (source, limit, offset) if source else (limit, offset)
+        # Build params: source (if any), then exclude_sources, then limit, offset
+        if source:
+            params = [source] + exclude_params + [limit, offset]
+        else:
+            params = exclude_params + [limit, offset]
         with self._lock:
             cursor = self._conn.execute(query, params)
             rows = cursor.fetchall()
@@ -569,6 +604,18 @@ class SessionDB:
                 s["preview"] = text + ("..." if len(raw) > 60 else "")
             else:
                 s["preview"] = ""
+            # Compute duration
+            started = s.get("started_at")
+            ended = s.get("ended_at")
+            if started and ended:
+                s["duration"] = ended - started
+            elif started:
+                s["duration"] = time.time() - started
+            else:
+                s["duration"] = 0
+            # Include tool error count
+            if include_tool_errors and "_tool_errors" in s:
+                s["tool_errors"] = s.pop("_tool_errors")
             sessions.append(s)
 
         return sessions
@@ -952,3 +999,647 @@ class SessionDB:
 
             self._conn.commit()
         return len(session_ids)
+
+    # =========================================================================
+    # User Prompt Database (B6)
+    # =========================================================================
+
+    @staticmethod
+    def _expand_pastes_in_text(text: str, pastes_dir: str = "~/.hermes/pastes") -> str:
+        """Resolve [Pasted text #N: N lines -> /path/to/file] references inline.
+
+        Returns the text with each paste reference replaced by its file contents,
+        prefixed with the filename so the receiving agent knows the source.
+        """
+        import os
+        import textwrap
+
+        resolved_dir = os.path.expanduser(pastes_dir)
+        pattern = r"\[Pasted text #\\d+: \d+ lines \xe2\x86\x92 (.+?)\]"
+
+        def _replacer(m: re.Match) -> str:
+            file_path = m.group(1).strip()
+            if os.path.exists(file_path):
+                try:
+                    file_content = Path(file_path).read_text(encoding="utf-8")
+                    fname = os.path.basename(file_path)
+                    return f"[--- Paste from {fname} ({file_path}) ---]\n{file_content}\n[--- End paste ---]"
+                except Exception:
+                    return f"[Paste file not readable: {file_path}]"
+            elif os.path.exists(resolved_dir) and os.path.exists(os.path.join(resolved_dir, os.path.basename(file_path))):
+                # Try relative to pastes_dir
+                full = os.path.join(resolved_dir, os.path.basename(file_path))
+                try:
+                    file_content = Path(full).read_text(encoding="utf-8")
+                    fname = os.path.basename(full)
+                    return f"[--- Paste from {fname} ({full}) ---]\n{file_content}\n[--- End paste ---]"
+                except Exception:
+                    return f"[Paste file not readable: {full}]"
+            else:
+                return f"[Paste file not found: {file_path}]"
+
+        return re.sub(pattern, _replacer, text)
+
+    def get_user_prompts(
+        self,
+        source_filter: str = None,
+        session_filter: str = None,
+        date_from: float = None,
+        date_to: float = None,
+        limit: int = 100,
+        offset: int = 0,
+        expand_pastes: bool = True,
+        pastes_dir: str = "~/.hermes/pastes",
+    ) -> List[Dict[str, Any]]:
+        """Query all user prompts with full session metadata.
+
+        Each returned dict includes:
+        - prompt_id: message id
+        - session_id: session id
+        - session_title: title from sessions table
+        - session_source: cli, telegram, discord, etc.
+        - model: model used for this session
+        - prompt: the raw user message content
+        - prompt_tokens: token count for this message
+        - prompt_timestamp: when the message was sent
+        - session_started_at: when the session started
+        - session_ended_at: when the session ended
+        - session_duration_s: duration in seconds (if ended)
+        - session_input_tokens: total input tokens for session
+        - session_output_tokens: total output tokens for session
+        - session_tool_calls: total tool call count
+        - session_estimated_cost: cost estimate
+        - prompt_expanded: the content with paste references resolved
+
+        Args:
+            source_filter: filter by session source (cli, telegram, etc.)
+            session_filter: filter by session_id
+            date_from: unix timestamp, prompts after this time
+            date_to: unix timestamp, prompts before this time
+            limit: max results
+            offset: skip N results
+            expand_pastes: if True, resolve paste refs inline in prompt_expanded
+        """
+        query = """
+            SELECT
+                m.id as prompt_id,
+                m.session_id,
+                s.title as session_title,
+                s.source as session_source,
+                s.model,
+                s.started_at as session_started_at,
+                s.ended_at as session_ended_at,
+                CASE WHEN s.ended_at IS NOT NULL
+                     THEN CAST(s.ended_at - s.started_at AS INTEGER)
+                     ELSE NULL END as session_duration_s,
+                s.input_tokens as session_input_tokens,
+                s.output_tokens as session_output_tokens,
+                s.tool_call_count as session_tool_calls,
+                s.estimated_cost_usd as session_estimated_cost,
+                s.billing_provider,
+                m.content as prompt_raw,
+                m.token_count as prompt_tokens,
+                m.timestamp as prompt_timestamp
+            FROM messages m
+            JOIN sessions s ON m.session_id = s.id
+            WHERE m.role = 'user'
+        """
+        params = []
+
+        if source_filter:
+            query += " AND s.source = ?"
+            params.append(source_filter)
+        if session_filter:
+            query += " AND m.session_id = ?"
+            params.append(session_filter)
+        if date_from:
+            query += " AND m.timestamp >= ?"
+            params.append(date_from)
+        if date_to:
+            query += " AND m.timestamp <= ?"
+            params.append(date_to)
+
+        query += " ORDER BY m.timestamp DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        with self._lock:
+            cursor = self._conn.execute(query, params)
+            rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            d = dict(row)
+            d["prompt"] = d.pop("prompt_raw")
+            if expand_pastes and d["prompt"]:
+                d["prompt_expanded"] = self._expand_pastes_in_text(
+                    d["prompt"], pastes_dir
+                )
+            else:
+                d["prompt_expanded"] = d["prompt"]
+            results.append(d)
+
+        return results
+
+    def get_user_prompts_count(
+        self,
+        source_filter: str = None,
+        date_from: float = None,
+        date_to: float = None,
+    ) -> int:
+        """Count total user prompts matching filters."""
+        query = """
+            SELECT COUNT(*) FROM messages m
+            JOIN sessions s ON m.session_id = s.id
+            WHERE m.role = 'user'
+        """
+        params = []
+        if source_filter:
+            query += " AND s.source = ?"
+            params.append(source_filter)
+        if date_from:
+            query += " AND m.timestamp >= ?"
+            params.append(date_from)
+        if date_to:
+            query += " AND m.timestamp <= ?"
+            params.append(date_to)
+
+        with self._lock:
+            cursor = self._conn.execute(query, params)
+            return cursor.fetchone()[0]
+
+    def search_user_prompts(
+        self,
+        query: str,
+        source_filter: str = None,
+        limit: int = 20,
+        offset: int = 0,
+        expand_pastes: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Full-text search user prompts using FTS5 with metadata."""
+        if not query or not query.strip():
+            return []
+
+        safe_query = self._sanitize_fts5_query(query)
+        if not safe_query:
+            return []
+        # Wrap in double-quotes for safe FTS5 matching of special chars
+        # This treats the entire query as an exact phrase match unless it contains operators
+        if not (safe_query.startswith('"') and safe_query.endswith('"')):
+            if ' AND ' not in safe_query and ' OR ' not in safe_query:
+                safe_query = '"' + safe_query.replace('"', '""') + '"'
+
+        sql = """
+            SELECT
+                m.id as prompt_id,
+                m.session_id,
+                s.title as session_title,
+                s.source as session_source,
+                s.model,
+                s.started_at as session_started_at,
+                s.ended_at as session_ended_at,
+                CASE WHEN s.ended_at IS NOT NULL
+                     THEN CAST(s.ended_at - s.started_at AS INTEGER)
+                     ELSE NULL END as session_duration_s,
+                s.input_tokens as session_input_tokens,
+                s.output_tokens as session_output_tokens,
+                s.tool_call_count as session_tool_calls,
+                s.estimated_cost_usd as session_estimated_cost,
+                s.billing_provider,
+                m.content as prompt_raw,
+                m.token_count as prompt_tokens,
+                m.timestamp as prompt_timestamp,
+                fts.rank as fts_rank
+            FROM messages m
+            JOIN sessions s ON m.session_id = s.id
+            JOIN messages_fts fts ON fts.rowid = m.id
+            WHERE m.role = 'user' AND messages_fts MATCH ?
+            ORDER BY fts.rank
+        """
+        params = [safe_query]
+        if source_filter:
+            sql += " AND s.source = ?"
+            params.append(source_filter)
+
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            d = dict(row)
+            d["prompt"] = d.pop("prompt_raw")
+            if expand_pastes and d["prompt"]:
+                d["prompt_expanded"] = self._expand_pastes_in_text(d["prompt"])
+            else:
+                d["prompt_expanded"] = d["prompt"]
+            results.append(d)
+
+        return results
+
+
+
+# =========================================================================
+# Cross-Tool Prompt Parsers (B6 Phase 1 — Option C: Query-on-Demand)
+# =========================================================================
+# Query wrappers that parse external CLI tool session logs on-the-fly.
+# No data import, no duplication — normalized format with tool metadata.
+# =========================================================================
+
+class ClaudeCodeParser:
+    """Parse Claude Code JSONL session logs from ~/.claude/projects/."""
+
+    def __init__(self, projects_dir: str = "~/.claude/projects"):
+        self.projects_dir = Path(projects_dir).expanduser()
+        self._tool = "claude-code"
+
+    def _iter_sessions(self):
+        """Yield (session_path, project_name) for all Claude Code sessions."""
+        if not self.projects_dir.exists():
+            return
+        for project in self.projects_dir.iterdir():
+            if project.is_dir():
+                for session_file in project.glob("*.jsonl"):
+                    yield session_file, project.name
+
+    def get_user_prompts(
+        self,
+        project_filter: str = None,
+        query: str = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Extract user prompts from Claude Code sessions.
+
+        Returns normalized format compatible with SessionDB.get_user_prompts().
+        Keys: prompt_id, source_tool, session_source, session_title, model,
+        prompt, prompt_expanded, prompt_timestamp, tool_calls_estimate, etc.
+        """
+        results = []
+        count = 0
+        for session_path, project_name in self._iter_sessions():
+            if project_filter and project_filter.lower() not in project_name.lower():
+                continue
+            try:
+                with open(session_path, "r", encoding="utf-8") as f:
+                    session_lines = f.readlines()
+                session_ts = session_path.stat().st_mtime
+                session_started_at = session_ts
+                has_user_prompt = False
+                # We cannot reliably reconstruct token counts from Claude Code JSONL
+                # (they may be in metadata, but we'd need to check)
+                for line in session_lines:
+                    try:
+                        data = json.loads(line)
+                        msg = data.get("message", {})
+                        if msg.get("role") == "user":
+                            content = msg.get("content", "")
+                            # Skip tool results (they're lists, not strings)
+                            if isinstance(content, str) and not content.startswith("["):
+                                has_user_prompt = True
+                                count += 1
+                                if count > offset and len(results) < limit:
+                                    results.append(
+                                        {
+                                            "prompt_id": None,
+                                            "source_tool": self._tool,
+                                            "session_source": f"claude-{project_name}",
+                                            "session_title": f"{project_name}",
+                                            "model": "claude-code (unknown)",
+                                            "prompt": content,
+                                            "prompt_expanded": content,  # No pastes in this context
+                                            "prompt_timestamp": session_ts,  # approximate per-session
+                                            "session_started_at": session_started_at,
+                                            "session_ended_at": None,
+                                            "session_duration_s": None,
+                                            "session_input_tokens": None,
+                                            "session_output_tokens": None,
+                                            "session_tool_calls": None,
+                                            "session_estimated_cost": None,
+                                            "billing_provider": None,
+                                        }
+                                    )
+                    except json.JSONDecodeError:
+                        continue
+                # If this session had no user prompts at all, we can ignore it
+            except Exception:
+                continue
+        return results
+
+    def count_user_prompts(self, project_filter: str = None) -> int:
+        count = 0
+        for session_path, project_name in self._iter_sessions():
+            if project_filter and project_filter.lower() not in project_name.lower():
+                continue
+            try:
+                with open(session_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            data = json.loads(line)
+                            if data.get("message", {}).get("role") == "user":
+                                content = data["message"].get("content", "")
+                                if isinstance(content, str) and not content.startswith("["):
+                                    count += 1
+                        except:
+                            continue
+            except:
+                continue
+        return count
+
+
+class CodexParser:
+    """Parse Codex CLI session logs from ~/.codex/sessions/."""
+
+    def __init__(self, sessions_dir: str = "~/.codex/sessions"):
+        self.sessions_dir = Path(sessions_dir).expanduser()
+        self._tool = "codex"
+
+    def _iter_sessions(self):
+        """Yield session files from the dated hierarchy."""
+        if not self.sessions_dir.exists():
+            return
+        for session_file in self.sessions_dir.rglob("*.jsonl"):
+            yield session_file
+
+    def get_user_prompts(
+        self,
+        query: str = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Extract user prompts from Codex sessions."""
+        results = []
+        count = 0
+        for session_path in self._iter_sessions():
+            try:
+                with open(session_path, "r", encoding="utf-8") as f:
+                    session_lines = f.readlines()
+                session_ts = session_path.stat().st_mtime
+                has_user_prompt = False
+                for line in session_lines:
+                    try:
+                        data = json.loads(line)
+                        msg = data.get("message", {})
+                        if msg.get("role") == "user":
+                            content = msg.get("content", "")
+                            if isinstance(content, str) and not content.startswith("["):
+                                has_user_prompt = True
+                                count += 1
+                                if count > offset and len(results) < limit:
+                                    results.append(
+                                        {
+                                            "prompt_id": None,
+                                            "source_tool": self._tool,
+                                            "session_source": f"codex-{session_path.parent.name}",
+                                            "session_title": session_path.name,
+                                            "model": "codex (unknown)",
+                                            "prompt": content,
+                                            "prompt_expanded": content,
+                                            "prompt_timestamp": session_ts,
+                                            "session_started_at": session_ts,
+                                            "session_ended_at": None,
+                                            "session_duration_s": None,
+                                            "session_input_tokens": None,
+                                            "session_output_tokens": None,
+                                            "session_tool_calls": None,
+                                            "session_estimated_cost": None,
+                                            "billing_provider": None,
+                                        }
+                                    )
+                            elif isinstance(content, list):
+                                # multimodal: may contain text parts
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        count += 1
+                                        if count > offset and len(results) < limit:
+                                            results.append(
+                                                {
+                                                    "prompt_id": None,
+                                                    "source_tool": self._tool,
+                                                    "session_source": f"codex-{session_path.parent.name}",
+                                                    "session_title": session_path.name,
+                                                    "model": "codex (unknown)",
+                                                    "prompt": part.get("text", ""),
+                                                    "prompt_expanded": part.get("text", ""),
+                                                    "prompt_timestamp": session_ts,
+                                                    "session_started_at": session_ts,
+                                                    "session_ended_at": None,
+                                                    "session_duration_s": None,
+                                                    "session_input_tokens": None,
+                                                    "session_output_tokens": None,
+                                                    "session_tool_calls": None,
+                                                    "session_estimated_cost": None,
+                                                    "billing_provider": None,
+                                                }
+                                            )
+                                        break
+                    except json.JSONDecodeError:
+                        continue
+            except Exception:
+                continue
+        return results
+
+    def count_user_prompts(self) -> int:
+        count = 0
+        for session_path in self._iter_sessions():
+            try:
+                with open(session_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            data = json.loads(line)
+                            if data.get("message", {}).get("role") == "user":
+                                count += 1
+                        except:
+                            continue
+            except:
+                continue
+        return count
+
+
+class QwenParser:
+    """Parse Qwen Code chat logs from ~/.qwen/projects/*/chats/*.jsonl."""
+
+    def __init__(self, projects_dir: str = "~/.qwen/projects"):
+        self.projects_dir = Path(projects_dir).expanduser()
+        self._tool = "qwen-code"
+
+    def _iter_sessions(self):
+        """Yield (session_path, project_name) for all Qwen Code sessions."""
+        if not self.projects_dir.exists():
+            return
+        for project in self.projects_dir.iterdir():
+            if project.is_dir():
+                chats_dir = project / "chats"
+                if chats_dir.exists():
+                    for session_file in chats_dir.glob("*.jsonl"):
+                        yield session_file, project.name
+
+    def get_user_prompts(
+        self,
+        project_filter: str = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Extract user prompts from Qwen Code sessions."""
+        results = []
+        count = 0
+        for session_path, project_name in self._iter_sessions():
+            if project_filter and project_filter.lower() not in project_name.lower():
+                continue
+            try:
+                with open(session_path, "r", encoding="utf-8") as f:
+                    session_lines = f.readlines()
+                session_ts = session_path.stat().st_mtime
+                for line in session_lines:
+                    try:
+                        data = json.loads(line)
+                        if data.get("type") == "user":
+                            msg = data.get("message", {})
+                            parts = msg.get("parts", [])
+                            for part in parts:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    content = part.get("text", "")
+                                    count += 1
+                                    if count > offset and len(results) < limit:
+                                        results.append(
+                                            {
+                                                "prompt_id": None,
+                                                "source_tool": self._tool,
+                                                "session_source": f"qwen-{project_name}",
+                                                "session_title": session_path.name,
+                                                "model": "qwen-code (unknown)",
+                                                "prompt": content,
+                                                "prompt_expanded": content,
+                                                "prompt_timestamp": session_ts,
+                                                "session_started_at": session_ts,
+                                                "session_ended_at": None,
+                                                "session_duration_s": None,
+                                                "session_input_tokens": None,
+                                                "session_output_tokens": None,
+                                                "session_tool_calls": None,
+                                                "session_estimated_cost": None,
+                                                "billing_provider": None,
+                                            }
+                                        )
+                                    break  # Only count each user message once
+                    except json.JSONDecodeError:
+                        continue
+            except Exception:
+                continue
+        return results
+
+    def count_user_prompts(self, project_filter: str = None) -> int:
+        count = 0
+        for session_path, project_name in self._iter_sessions():
+            if project_filter and project_filter.lower() not in project_name.lower():
+                continue
+            try:
+                with open(session_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            data = json.loads(line)
+                            if data.get("type") == "user":
+                                count += 1
+                        except:
+                            continue
+            except:
+                continue
+        return count
+
+
+class CrossToolPrompts:
+    """Unified query interface for all supported CLI tools."""
+
+    def __init__(self):
+        self.claude_parser = ClaudeCodeParser()
+        self.codex_parser = CodexParser()
+        self.qwen_parser = QwenParser()
+
+    def get_all_user_prompts(
+        self,
+        sources: List[str] = None,
+        tools: List[str] = None,
+        query: str = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Aggregate prompts from Hermes DB + external tools.
+
+        Args:
+            sources: List of source tools to include (e.g., ['hermes', 'claude', 'codex', 'qwen'])
+            query: Full-text search (only applies to Hermes DB for now; future: tool FTS)
+            limit: Max total results
+            offset: Pagination offset
+
+        Returns unified list with same schema as SessionDB.get_user_prompts().
+        """
+        all_results = []
+        remaining = limit
+
+        # 1. Hermes DB if requested
+        if sources is None or "hermes" in sources:
+            db = SessionDB(Path("~/.hermes/state.db").expanduser())
+            # get_user_prompts already handles FTS search if query is provided
+            if tools is None or "hermes" in tools:
+                results = db.get_user_prompts(
+                    source_filter=None,
+                    limit=remaining,
+                    offset=offset,
+                    expand_pastes=False,
+                )
+                all_results.extend(results)
+                remaining = limit - len(all_results)
+                if remaining <= 0:
+                    return all_results[:limit]
+
+        # 2. Claude Code
+        if (sources is None or "claude" in sources) and (tools is None or "claude-code" in tools):
+            results = self.claude_parser.get_user_prompts(limit=remaining)
+            all_results.extend(results)
+            remaining = limit - len(all_results)
+            if remaining <= 0:
+                return all_results[:limit]
+
+        # 3. Codex
+        if (sources is None or "codex" in sources) and (tools is None or "codex" in tools):
+            results = self.codex_parser.get_user_prompts(limit=remaining)
+            all_results.extend(results)
+            remaining = limit - len(all_results)
+            if remaining <= 0:
+                return all_results[:limit]
+
+        # 4. Qwen Code
+        if (sources is None or "qwen" in sources) and (tools is None or "qwen-code" in tools):
+            results = self.qwen_parser.get_user_prompts(limit=remaining)
+            all_results.extend(results)
+            remaining = limit - len(all_results)
+            if remaining <= 0:
+                return all_results[:limit]
+
+        # Note: full-text search across tools would require a separate indexing pass
+        # For now, if query is provided, we filter locally on the combined results
+        if query:
+            q_lower = query.lower()
+            all_results = [
+                r for r in all_results if q_lower in r.get("prompt", "").lower() or q_lower in r.get("session_title", "").lower()
+            ]
+
+        return all_results[:limit]
+
+    def count_all(self, tools: List[str] = None) -> Dict[str, int]:
+        """Return counts for each tool and total."""
+        counts = {}
+        # Hermes
+        db = SessionDB(Path("~/.hermes/state.db").expanduser())
+        hermes_total = db.get_user_prompts_count()
+        counts["hermes"] = hermes_total
+        # Claude Code
+        counts["claude-code"] = self.claude_parser.count_user_prompts()
+        # Codex
+        counts["codex"] = self.codex_parser.count_user_prompts()
+        # Qwen Code
+        counts["qwen-code"] = self.qwen_parser.count_user_prompts()
+        return counts
+

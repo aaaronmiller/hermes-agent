@@ -561,6 +561,26 @@ def _get_auxiliary_env_override(task: str, suffix: str) -> Optional[str]:
     return None
 
 
+def _resolve_config_api_key(task_config: Dict[str, Any]) -> Optional[str]:
+    """Resolve auxiliary API key config.
+
+    Supports both direct keys via ``api_key`` and indirect keys via
+    ``api_key_env``.  ``api_key_env`` wins so configs can keep secrets in env
+    files without copying raw keys into config.yaml.
+    """
+    if not isinstance(task_config, dict):
+        return None
+
+    api_key_env = str(task_config.get("api_key_env", "")).strip()
+    if api_key_env:
+        env_value = os.getenv(api_key_env, "").strip()
+        if env_value:
+            return env_value
+
+    api_key = str(task_config.get("api_key", "")).strip()
+    return api_key or None
+
+
 def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
     or_key = os.getenv("OPENROUTER_API_KEY")
     if not or_key:
@@ -1340,7 +1360,7 @@ def _resolve_task_provider_model(
         cfg_provider = str(task_config.get("provider", "")).strip() or None
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
-        cfg_api_key = str(task_config.get("api_key", "")).strip() or None
+        cfg_api_key = _resolve_config_api_key(task_config)
 
         # Backwards compat: compression section has its own keys.
         # The auxiliary.compression defaults to provider="auto", so treat
